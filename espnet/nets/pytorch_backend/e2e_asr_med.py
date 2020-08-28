@@ -12,8 +12,8 @@ Refer to: https://arxiv.org/abs/2005.08100
 
 from distutils.util import strtobool
 
-from espnet.nets.pytorch_backend.transformer.encoder import Encoder
-from espnet.nets.pytorch_backend.med.encoder import Decoder
+from espnet.nets.pytorch_backend.med.encoder import Encoder
+from espnet.nets.pytorch_backend.med.decoder import Decoder
 from espnet.nets.pytorch_backend.e2e_asr_transformer import E2E as E2ETransformer
 
 
@@ -57,7 +57,6 @@ class E2E(E2ETransformer):
         super().__init__(idim, odim, args, ignore_id)
         if args.transformer_attn_dropout_rate is None:
             args.transformer_attn_dropout_rate = args.dropout_rate
-
         self.encoder = Encoder(
             idim=idim,
             selfattention_layer_type=args.transformer_encoder_selfattn_layer_type,
@@ -139,7 +138,7 @@ class E2E(E2ETransformer):
         # TODO(karita) show predicted text
         # TODO(karita) calculate these stats
         cer_ctc = None
-        hs_pad = (hs_pad.view(batch_size, -1, self.adim)+hs_pad2.view(batch_size, -1, self.adim))/2
+        hs_pad = (hs_pad.view(batch_size, -1, self.adim)+hs_pad2.view(batch_size, -1, self.adim))
         if self.mtlalpha == 0.0:
             loss_ctc = None
         else:
@@ -183,3 +182,328 @@ class E2E(E2ETransformer):
         else:
             logging.warning("loss (=%f) is not correct", loss_data)
         return self.loss
+    
+    def encode(self, x):
+        """Encode acoustic features.
+
+        :param ndarray x: source acoustic feature (T, D)
+        :return: encoder outputs
+        :rtype: torch.Tensor
+        """
+        self.eval()
+        x = torch.as_tensor(x).unsqueeze(0)
+        enc_output, _, enc_output2, _2 = self.encoder(x, None)
+        return enc_output.squeeze(0), enc_output2.squeeze(0)
+    
+    def recognize(self, x, recog_args, char_list=None, rnnlm=None, use_jit=False):
+        """Recognize input speech.
+
+        :param ndnarray x: input acoustic feature (B, T, D) or (T, D)
+        :param Namespace recog_args: argment Namespace contraining options
+        :param list char_list: list of characters
+        :param torch.nn.Module rnnlm: language model module
+        :return: N-best decoding results
+        :rtype: list
+        """
+        encx1, encx2 = self.encode(x)
+        enc_output = (encx1 + encx2).unsqueeze(0)
+        if self.mtlalpha == 1.0:
+            recog_args.ctc_weight = 1.0
+            logging.info("Set to pure CTC decoding mode.")
+
+        if self.mtlalpha > 0 and recog_args.ctc_weight == 1.0:
+            from itertools import groupby
+
+            lpz = self.ctc.argmax(enc_output)
+            collapsed_indices = [x[0] for x in groupby(lpz[0])]
+            hyp = [x for x in filter(lambda x: x != self.blank, collapsed_indices)]
+            nbest_hyps = [{"score": 0.0, "yseq": hyp}]
+            if recog_args.beam_size > 1:
+                raise NotImplementedError("Pure CTC beam search is not implemented.")
+            # TODO(hirofumi0810): Implement beam search
+            return nbest_hyps
+        elif self.mtlalpha > 0 and recog_args.ctc_weight > 0.0:
+            lpz = self.ctc.log_softmax(enc_output)
+            lpz = lpz.squeeze(0)
+        else:
+            lpz = None
+
+        h = enc_output.squeeze(0)
+
+        logging.info("input lengths: " + str(h.size(0)))
+        # search parms
+        beam = recog_args.beam_size
+        penalty = recog_args.penalty
+        ctc_weight = recog_args.ctc_weight
+
+        # preprare sos
+        y = self.sos
+        vy = h.new_zeros(1).long()
+
+        if recog_args.maxlenratio == 0:
+            maxlen = h.shape[0]
+        else:
+            # maxlen >= 1
+            maxlen = max(1, int(recog_args.maxlenratio * h.size(0)))
+        minlen = int(recog_args.minlenratio * h.size(0))
+        logging.info("max output length: " + str(maxlen))
+        logging.info("min output length: " + str(minlen))
+
+        # initialize hypothesis
+        if rnnlm:
+            hyp = {"score": 0.0, "yseq": [y], "rnnlm_prev": None}
+        else:
+            hyp = {"score": 0.0, "yseq": [y]}
+        if lpz is not None:
+            ctc_prefix_score = CTCPrefixScore(lpz.detach().numpy(), 0, self.eos, numpy)
+            hyp["ctc_state_prev"] = ctc_prefix_score.initial_state()
+            hyp["ctc_score_prev"] = 0.0
+            if ctc_weight != 1.0:
+                # pre-pruning based on attention scores
+                ctc_beam = min(lpz.shape[-1], int(beam * CTC_SCORING_RATIO))
+            else:
+                ctc_beam = lpz.shape[-1]
+        hyps = [hyp]
+        ended_hyps = []
+
+        import six
+
+        traced_decoder = None
+        for i in six.moves.range(maxlen):
+            logging.debug("position " + str(i))
+
+            hyps_best_kept = []
+            for hyp in hyps:
+                vy[0] = hyp["yseq"][i]
+
+                # get nbest local scores and their ids
+                ys_mask = subsequent_mask(i + 1).unsqueeze(0)
+                ys = torch.tensor(hyp["yseq"]).unsqueeze(0)
+                # FIXME: jit does not match non-jit result
+                if use_jit:
+                    if traced_decoder is None:
+                        traced_decoder = torch.jit.trace(
+                            self.decoder.forward_one_step, (ys, ys_mask, enc_output)
+                        )
+                    local_att_scores = traced_decoder(ys, ys_mask, enc_output)[0]
+                else:
+                    local_att_scores = self.decoder.forward_one_step(
+                        ys, ys_mask, enc_output
+                    )[0]
+
+                if rnnlm:
+                    rnnlm_state, local_lm_scores = rnnlm.predict(hyp["rnnlm_prev"], vy)
+                    local_scores = (
+                        local_att_scores + recog_args.lm_weight * local_lm_scores
+                    )
+                else:
+                    local_scores = local_att_scores
+
+                if lpz is not None:
+                    local_best_scores, local_best_ids = torch.topk(
+                        local_att_scores, ctc_beam, dim=1
+                    )
+                    ctc_scores, ctc_states = ctc_prefix_score(
+                        hyp["yseq"], local_best_ids[0], hyp["ctc_state_prev"]
+                    )
+                    local_scores = (1.0 - ctc_weight) * local_att_scores[
+                        :, local_best_ids[0]
+                    ] + ctc_weight * torch.from_numpy(
+                        ctc_scores - hyp["ctc_score_prev"]
+                    )
+                    if rnnlm:
+                        local_scores += (
+                            recog_args.lm_weight * local_lm_scores[:, local_best_ids[0]]
+                        )
+                    local_best_scores, joint_best_ids = torch.topk(
+                        local_scores, beam, dim=1
+                    )
+                    local_best_ids = local_best_ids[:, joint_best_ids[0]]
+                else:
+                    local_best_scores, local_best_ids = torch.topk(
+                        local_scores, beam, dim=1
+                    )
+
+                for j in six.moves.range(beam):
+                    new_hyp = {}
+                    new_hyp["score"] = hyp["score"] + float(local_best_scores[0, j])
+                    new_hyp["yseq"] = [0] * (1 + len(hyp["yseq"]))
+                    new_hyp["yseq"][: len(hyp["yseq"])] = hyp["yseq"]
+                    new_hyp["yseq"][len(hyp["yseq"])] = int(local_best_ids[0, j])
+                    if rnnlm:
+                        new_hyp["rnnlm_prev"] = rnnlm_state
+                    if lpz is not None:
+                        new_hyp["ctc_state_prev"] = ctc_states[joint_best_ids[0, j]]
+                        new_hyp["ctc_score_prev"] = ctc_scores[joint_best_ids[0, j]]
+                    # will be (2 x beam) hyps at most
+                    hyps_best_kept.append(new_hyp)
+
+                hyps_best_kept = sorted(
+                    hyps_best_kept, key=lambda x: x["score"], reverse=True
+                )[:beam]
+
+            # sort and get nbest
+            hyps = hyps_best_kept
+            logging.debug("number of pruned hypothes: " + str(len(hyps)))
+            if char_list is not None:
+                logging.debug(
+                    "best hypo: "
+                    + "".join([char_list[int(x)] for x in hyps[0]["yseq"][1:]])
+                )
+
+            # add eos in the final loop to avoid that there are no ended hyps
+            if i == maxlen - 1:
+                logging.info("adding <eos> in the last postion in the loop")
+                for hyp in hyps:
+                    hyp["yseq"].append(self.eos)
+
+            # add ended hypothes to a final list, and removed them from current hypothes
+            # (this will be a probmlem, number of hyps < beam)
+            remained_hyps = []
+            for hyp in hyps:
+                if hyp["yseq"][-1] == self.eos:
+                    # only store the sequence that has more than minlen outputs
+                    # also add penalty
+                    if len(hyp["yseq"]) > minlen:
+                        hyp["score"] += (i + 1) * penalty
+                        if rnnlm:  # Word LM needs to add final <eos> score
+                            hyp["score"] += recog_args.lm_weight * rnnlm.final(
+                                hyp["rnnlm_prev"]
+                            )
+                        ended_hyps.append(hyp)
+                else:
+                    remained_hyps.append(hyp)
+
+            # end detection
+            if end_detect(ended_hyps, i) and recog_args.maxlenratio == 0.0:
+                logging.info("end detected at %d", i)
+                break
+
+            hyps = remained_hyps
+            if len(hyps) > 0:
+                logging.debug("remeined hypothes: " + str(len(hyps)))
+            else:
+                logging.info("no hypothesis. Finish decoding.")
+                break
+
+            if char_list is not None:
+                for hyp in hyps:
+                    logging.debug(
+                        "hypo: " + "".join([char_list[int(x)] for x in hyp["yseq"][1:]])
+                    )
+
+            logging.debug("number of ended hypothes: " + str(len(ended_hyps)))
+
+        nbest_hyps = sorted(ended_hyps, key=lambda x: x["score"], reverse=True)[
+            : min(len(ended_hyps), recog_args.nbest)
+        ]
+
+        # check number of hypotheis
+        if len(nbest_hyps) == 0:
+            logging.warning(
+                "there is no N-best results, perform recognition "
+                "again with smaller minlenratio."
+            )
+            # should copy becasuse Namespace will be overwritten globally
+            recog_args = Namespace(**vars(recog_args))
+            recog_args.minlenratio = max(0.0, recog_args.minlenratio - 0.1)
+            return self.recognize(x, recog_args, char_list, rnnlm)
+
+        logging.info("total log probability: " + str(nbest_hyps[0]["score"]))
+        logging.info(
+            "normalized log probability: "
+            + str(nbest_hyps[0]["score"] / len(nbest_hyps[0]["yseq"]))
+        )
+        return nbest_hyps
+
+    def recognize_maskctc(self, x, recog_args, char_list=None):
+        """Non-autoregressive decoding using Mask CTC.
+
+        :param ndnarray x: input acoustic feature (B, T, D) or (T, D)
+        :param Namespace recog_args: argment Namespace contraining options
+        :param list char_list: list of characters
+        :return: decoding result
+        :rtype: list
+        """
+        self.eval()
+        h1, h2 = self.encode(x)
+        h = (h1 + h2).unsqueeze(0)
+
+        ctc_probs, ctc_ids = torch.exp(self.ctc.log_softmax(h)).max(dim=-1)
+        y_hat = torch.stack([x[0] for x in groupby(ctc_ids[0])])
+        y_idx = torch.nonzero(y_hat != 0).squeeze(-1)
+
+        probs_hat = []
+        cnt = 0
+        for i, y in enumerate(y_hat.tolist()):
+            probs_hat.append(-1)
+            while cnt < ctc_ids.shape[1] and y == ctc_ids[0][cnt]:
+                if probs_hat[i] < ctc_probs[0][cnt]:
+                    probs_hat[i] = ctc_probs[0][cnt].item()
+                cnt += 1
+        probs_hat = torch.from_numpy(numpy.array(probs_hat))
+
+        char_mask = "_"
+        p_thres = recog_args.maskctc_probability_threshold
+        mask_idx = torch.nonzero(probs_hat[y_idx] < p_thres).squeeze(-1)
+        confident_idx = torch.nonzero(probs_hat[y_idx] >= p_thres).squeeze(-1)
+        mask_num = len(mask_idx)
+
+        y_in = torch.zeros(1, len(y_idx) + 1, dtype=torch.long) + self.mask_token
+        y_in[0][confident_idx] = y_hat[y_idx][confident_idx]
+        y_in[0][-1] = self.eos
+
+        logging.info(
+            "ctc:{}".format(
+                "".join(
+                    [
+                        char_list[y] if y != self.mask_token else char_mask
+                        for y in y_in[0].tolist()
+                    ]
+                ).replace("<space>", " ")
+            )
+        )
+
+        if not mask_num == 0:
+            K = recog_args.maskctc_n_iterations
+            num_iter = K if mask_num >= K and K > 0 else mask_num
+
+            for t in range(1, num_iter):
+                pred, _ = self.decoder(
+                    y_in, (y_in != self.ignore_id).unsqueeze(-2), h, None
+                )
+                pred_sc, pred_id = pred[0][mask_idx].max(dim=-1)
+                cand = torch.topk(pred_sc, mask_num // num_iter, -1)[1]
+                y_in[0][mask_idx[cand]] = pred_id[cand]
+                mask_idx = torch.nonzero(y_in[0] == self.mask_token).squeeze(-1)
+
+                logging.info(
+                    "msk:{}".format(
+                        "".join(
+                            [
+                                char_list[y] if y != self.mask_token else char_mask
+                                for y in y_in[0].tolist()
+                            ]
+                        ).replace("<space>", " ")
+                    )
+                )
+
+            pred, pred_mask = self.decoder(
+                y_in, (y_in != self.ignore_id).unsqueeze(-2), h, None
+            )
+            y_in[0][mask_idx] = pred[0][mask_idx].argmax(dim=-1)
+            logging.info(
+                "msk:{}".format(
+                    "".join(
+                        [
+                            char_list[y] if y != self.mask_token else char_mask
+                            for y in y_in[0].tolist()
+                        ]
+                    ).replace("<space>", " ")
+                )
+            )
+
+        ret = y_in.tolist()[0][:-1]
+        hyp = {"score": 0.0, "yseq": [self.sos] + ret + [self.eos]}
+
+        return [hyp]

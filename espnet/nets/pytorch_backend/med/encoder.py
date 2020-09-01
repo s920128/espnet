@@ -307,7 +307,6 @@ class Encoder(torch.nn.Module):
         if xs2==None and masks2==None:
             xs2=xs
             masks2=masks
-            print(xs2.shape)
         if isinstance(
             self.embed,
             (Conv2dSubsampling, Conv2dSubsampling6, Conv2dSubsampling8, VGG2L),
@@ -317,9 +316,7 @@ class Encoder(torch.nn.Module):
         else:
             xs = self.embed(xs)
             xs2 = self.embed2(xs2)
-        print(xs.shape)
         xs, masks = self.encoders(xs, masks)
-        print(xs2.shape)
         xs2, masks2 = self.encoders2(xs2, masks2)
         if self.normalize_before:
             xs = self.after_norm(xs)

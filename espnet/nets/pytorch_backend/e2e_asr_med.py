@@ -1,23 +1,50 @@
-# Copyright 2020 Johns Hopkins University (Shinji Watanabe)
-#                Northwestern Polytechnical University (Pengcheng Guo)
+# Copyright 2019 Shigeki Karita
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
-"""
-Conformer speech recognition model (pytorch).
+"""Transformer speech recognition model (pytorch)."""
 
-It is a fusion of `e2e_asr_transformer.py`
-Refer to: https://arxiv.org/abs/2005.08100
-
-"""
-
+from argparse import Namespace
 from distutils.util import strtobool
+from itertools import groupby
+import logging
+import math
 
-from espnet.nets.pytorch_backend.med.encoder import Encoder
+import numpy
+import torch
+
+from espnet.nets.asr_interface import ASRInterface
+from espnet.nets.ctc_prefix_score import CTCPrefixScore
+from espnet.nets.e2e_asr_common import end_detect
+from espnet.nets.e2e_asr_common import ErrorCalculator
+from espnet.nets.pytorch_backend.ctc import CTC
+from espnet.nets.pytorch_backend.e2e_asr import CTC_LOSS_THRESHOLD
+from espnet.nets.pytorch_backend.e2e_asr import Reporter
+from espnet.nets.pytorch_backend.nets_utils import get_subsample
+from espnet.nets.pytorch_backend.nets_utils import make_non_pad_mask
+from espnet.nets.pytorch_backend.nets_utils import th_accuracy
+from espnet.nets.pytorch_backend.rnn.decoders import CTC_SCORING_RATIO
+from espnet.nets.pytorch_backend.transformer.add_sos_eos import add_sos_eos
+from espnet.nets.pytorch_backend.transformer.add_sos_eos import mask_uniform
+from espnet.nets.pytorch_backend.transformer.attention import (
+    MultiHeadedAttention,  # noqa: H301
+    RelPositionMultiHeadedAttention,  # noqa: H301
+)
 from espnet.nets.pytorch_backend.med.decoder import Decoder
-from espnet.nets.pytorch_backend.e2e_asr_transformer import E2E as E2ETransformer
+from espnet.nets.pytorch_backend.transformer.dynamic_conv import DynamicConvolution
+from espnet.nets.pytorch_backend.transformer.dynamic_conv2d import DynamicConvolution2D
+from espnet.nets.pytorch_backend.med.encoder import Encoder
+from espnet.nets.pytorch_backend.transformer.initializer import initialize
+from espnet.nets.pytorch_backend.transformer.label_smoothing_loss import (
+    LabelSmoothingLoss,  # noqa: H301
+)
+from espnet.nets.pytorch_backend.transformer.mask import subsequent_mask
+from espnet.nets.pytorch_backend.transformer.mask import target_mask
+from espnet.nets.pytorch_backend.transformer.plot import PlotAttentionReport
+from espnet.nets.scorers.ctc import CTCPrefixScorer
+from espnet.utils.fill_missing_args import fill_missing_args
 
 
-class E2E(E2ETransformer):
+class E2E(ASRInterface, torch.nn.Module):
     """E2E module.
 
     :param int idim: dimension of inputs
@@ -29,23 +56,170 @@ class E2E(E2ETransformer):
     @staticmethod
     def add_arguments(parser):
         """Add arguments."""
-        E2ETransformer.add_arguments(parser)
-        E2E.add_conformer_arguments(parser)
-        return parser
+        group = parser.add_argument_group("transformer model setting")
 
-    @staticmethod
-    def add_conformer_arguments(parser):
-        """Add arguments for conformer model."""
-        group = parser.add_argument_group("med model specific setting")
         group.add_argument(
-            "--transformer-encoder-pos-enc-layer-type",
+            "--transformer-init",
             type=str,
-            default="abs_pos",
-            choices=["abs_pos", "scaled_abs_pos", "rel_pos"],
-            help="transformer encoder positional encoding layer type",
+            default="pytorch",
+            choices=[
+                "pytorch",
+                "xavier_uniform",
+                "xavier_normal",
+                "kaiming_uniform",
+                "kaiming_normal",
+            ],
+            help="how to initialize transformer parameters",
         )
-
+        group.add_argument(
+            "--transformer-input-layer",
+            type=str,
+            default="conv2d",
+            choices=["conv2d", "linear", "embed"],
+            help="transformer input layer type",
+        )
+        group.add_argument(
+            "--transformer-attn-dropout-rate",
+            default=None,
+            type=float,
+            help="dropout in transformer attention. use --dropout-rate if None is set",
+        )
+        group.add_argument(
+            "--transformer-lr",
+            default=10.0,
+            type=float,
+            help="Initial value of learning rate",
+        )
+        group.add_argument(
+            "--transformer-warmup-steps",
+            default=25000,
+            type=int,
+            help="optimizer warmup steps",
+        )
+        group.add_argument(
+            "--transformer-length-normalized-loss",
+            default=True,
+            type=strtobool,
+            help="normalize loss by length",
+        )
+        group.add_argument(
+            "--transformer-encoder-selfattn-layer-type",
+            type=str,
+            default="selfattn",
+            choices=[
+                "selfattn",
+                "rel_selfattn",
+                "lightconv",
+                "lightconv2d",
+                "dynamicconv",
+                "dynamicconv2d",
+                "light-dynamicconv2d",
+            ],
+            help="transformer encoder self-attention layer type",
+        )
+        group.add_argument(
+            "--transformer-decoder-selfattn-layer-type",
+            type=str,
+            default="selfattn",
+            choices=[
+                "selfattn",
+                "lightconv",
+                "lightconv2d",
+                "dynamicconv",
+                "dynamicconv2d",
+                "light-dynamicconv2d",
+            ],
+            help="transformer decoder self-attention layer type",
+        )
+        # Lightweight/Dynamic convolution related parameters.
+        # See https://arxiv.org/abs/1912.11793v2
+        # and https://arxiv.org/abs/1901.10430 for detail of the method.
+        # Configurations used in the first paper are in
+        # egs/{csj, librispeech}/asr1/conf/tuning/ld_conv/
+        group.add_argument(
+            "--wshare",
+            default=4,
+            type=int,
+            help="Number of parameter shargin for lightweight convolution",
+        )
+        group.add_argument(
+            "--ldconv-encoder-kernel-length",
+            default="21_23_25_27_29_31_33_35_37_39_41_43",
+            type=str,
+            help="kernel size for lightweight/dynamic convolution: "
+            'Encoder side. For example, "21_23_25" means kernel length 21 for '
+            "First layer, 23 for Second layer and so on.",
+        )
+        group.add_argument(
+            "--ldconv-decoder-kernel-length",
+            default="11_13_15_17_19_21",
+            type=str,
+            help="kernel size for lightweight/dynamic convolution: "
+            'Decoder side. For example, "21_23_25" means kernel length 21 for '
+            "First layer, 23 for Second layer and so on.",
+        )
+        group.add_argument(
+            "--ldconv-usebias",
+            type=strtobool,
+            default=False,
+            help="use bias term in lightweight/dynamic convolution",
+        )
+        group.add_argument(
+            "--dropout-rate",
+            default=0.0,
+            type=float,
+            help="Dropout rate for the encoder",
+        )
+        # Encoder
+        group.add_argument(
+            "--elayers",
+            default=4,
+            type=int,
+            help="Number of encoder layers (for shared recognition part "
+            "in multi-speaker asr mode)",
+        )
+        group.add_argument(
+            "--eunits",
+            "-u",
+            default=300,
+            type=int,
+            help="Number of encoder hidden units",
+        )
+        # Attention
+        group.add_argument(
+            "--adim",
+            default=320,
+            type=int,
+            help="Number of attention transformation dimensions",
+        )
+        group.add_argument(
+            "--aheads",
+            default=4,
+            type=int,
+            help="Number of heads for multi head attention",
+        )
+        # Decoder
+        group.add_argument(
+            "--dlayers", default=1, type=int, help="Number of decoder layers"
+        )
+        group.add_argument(
+            "--dunits", default=320, type=int, help="Number of decoder hidden units"
+        )
+        # Non-autoregressive training
+        group.add_argument(
+            "--decoder-mode",
+            default="AR",
+            type=str,
+            choices=["ar", "maskctc"],
+            help="AR: standard autoregressive training, "
+            "maskctc: non-autoregressive training based on Mask CTC",
+        )
         return parser
+
+    @property
+    def attention_plot_class(self):
+        """Return PlotAttentionReport."""
+        return PlotAttentionReport
 
     def __init__(self, idim, odim, args, ignore_id=-1):
         """Construct an E2E object.
@@ -54,7 +228,11 @@ class E2E(E2ETransformer):
         :param int odim: dimension of outputs
         :param Namespace args: argument Namespace containing options
         """
-        super().__init__(idim, odim, args, ignore_id)
+        torch.nn.Module.__init__(self)
+
+        # fill missing arguments for compatibility
+        args = fill_missing_args(args, self.add_arguments)
+
         if args.transformer_attn_dropout_rate is None:
             args.transformer_attn_dropout_rate = args.dropout_rate
         self.encoder = Encoder(
@@ -72,7 +250,6 @@ class E2E(E2ETransformer):
             positional_dropout_rate=args.dropout_rate,
             attention_dropout_rate=args.transformer_attn_dropout_rate,
         )
-        
         if args.mtlalpha < 1:
             self.decoder = Decoder(
                 odim=odim,
@@ -89,7 +266,55 @@ class E2E(E2ETransformer):
                 self_attention_dropout_rate=args.transformer_attn_dropout_rate,
                 src_attention_dropout_rate=args.transformer_attn_dropout_rate,
             )
+            self.criterion = LabelSmoothingLoss(
+                odim,
+                ignore_id,
+                args.lsm_weight,
+                args.transformer_length_normalized_loss,
+            )
+        else:
+            self.decoder = None
+            self.criterion = None
+        self.blank = 0
+        self.decoder_mode = args.decoder_mode
+        if self.decoder_mode == "maskctc":
+            self.mask_token = odim - 1
+            self.sos = odim - 2
+            self.eos = odim - 2
+        else:
+            self.sos = odim - 1
+            self.eos = odim - 1
+        self.odim = odim
+        self.ignore_id = ignore_id
+        self.subsample = get_subsample(args, mode="asr", arch="transformer")
+        self.reporter = Reporter()
+
         self.reset_parameters(args)
+        self.adim = args.adim  # used for CTC (equal to d_model)
+        self.mtlalpha = args.mtlalpha
+        if args.mtlalpha > 0.0:
+            self.ctc = CTC(
+                odim, args.adim, args.dropout_rate, ctc_type=args.ctc_type, reduce=True
+            )
+        else:
+            self.ctc = None
+
+        if args.report_cer or args.report_wer:
+            self.error_calculator = ErrorCalculator(
+                args.char_list,
+                args.sym_space,
+                args.sym_blank,
+                args.report_cer,
+                args.report_wer,
+            )
+        else:
+            self.error_calculator = None
+        self.rnnlm = None
+
+    def reset_parameters(self, args):
+        """Initialize parameters."""
+        # initialize parameters
+        initialize(self, args.transformer_init)
 
     def forward(self, xs_pad, ilens, ys_pad):
         """E2E forward.
@@ -107,7 +332,7 @@ class E2E(E2ETransformer):
         # 1. forward encoder
         xs_pad = xs_pad[:, : max(ilens)]  # for data parallel
         src_mask = make_non_pad_mask(ilens.tolist()).to(xs_pad.device).unsqueeze(-2)
-        hs_pad, hs_mask, hs_pad2, hs_mask2= self.encoder(xs_pad, src_mask)
+        hs_pad, hs_mask, hs_pad2, hs_mask2 = self.encoder(xs_pad, src_mask)
         self.hs_pad = hs_pad
         self.hs_pad2 = hs_pad2
 
@@ -138,13 +363,14 @@ class E2E(E2ETransformer):
         # TODO(karita) show predicted text
         # TODO(karita) calculate these stats
         cer_ctc = None
-        hs_pad = (hs_pad.view(batch_size, -1, self.adim)+hs_pad2.view(batch_size, -1, self.adim))
+        hs_pad = (hs_pad+hs_pad2)/2
         if self.mtlalpha == 0.0:
             loss_ctc = None
         else:
             batch_size = xs_pad.size(0)
             hs_len = hs_mask.view(batch_size, -1).sum(1)
-            loss_ctc = self.ctc( hs_pad, hs_len, ys_pad)
+            loss_ctc = self.ctc(hs_pad.view(batch_size, -1, self.adim), hs_len, ys_pad)
+            print(hs_pad.view(batch_size, -1, self.adim), hs_len, ys_pad)
             if not self.training and self.error_calculator is not None:
                 ys_hat = self.ctc.argmax(hs_pad.view(batch_size, -1, self.adim)).data
                 cer_ctc = self.error_calculator(ys_hat.cpu(), ys_pad.cpu(), is_ctc=True)
@@ -182,7 +408,11 @@ class E2E(E2ETransformer):
         else:
             logging.warning("loss (=%f) is not correct", loss_data)
         return self.loss
-    
+
+    def scorers(self):
+        """Scorers."""
+        return dict(decoder=self.decoder, ctc=CTCPrefixScorer(self.ctc, self.eos))
+
     def encode(self, x):
         """Encode acoustic features.
 
@@ -194,7 +424,7 @@ class E2E(E2ETransformer):
         x = torch.as_tensor(x).unsqueeze(0)
         enc_output, _, enc_output2, _2 = self.encoder(x, None)
         return enc_output.squeeze(0), enc_output2.squeeze(0)
-    
+
     def recognize(self, x, recog_args, char_list=None, rnnlm=None, use_jit=False):
         """Recognize input speech.
 
@@ -207,6 +437,8 @@ class E2E(E2ETransformer):
         """
         encx1, encx2 = self.encode(x)
         enc_output = (encx1 + encx2).unsqueeze(0)
+        encx1 = encx1.unsqueeze(0)
+        encx2 = encx2.unsqueeze(0)
         if self.mtlalpha == 1.0:
             recog_args.ctc_weight = 1.0
             logging.info("Set to pure CTC decoding mode.")
@@ -283,12 +515,12 @@ class E2E(E2ETransformer):
                 if use_jit:
                     if traced_decoder is None:
                         traced_decoder = torch.jit.trace(
-                            self.decoder.forward_one_step, (ys, ys_mask, enc_output)
+                            self.decoder.forward_one_step, (ys, ys_mask, encx1, encx2)
                         )
-                    local_att_scores = traced_decoder(ys, ys_mask, enc_output)[0]
+                    local_att_scores = traced_decoder(ys, ys_mask, encx1, encx2)[0]
                 else:
                     local_att_scores = self.decoder.forward_one_step(
-                        ys, ys_mask, enc_output
+                        ys, ys_mask, encx1, encx2
                     )[0]
 
                 if rnnlm:
@@ -426,8 +658,7 @@ class E2E(E2ETransformer):
         :rtype: list
         """
         self.eval()
-        h1, h2 = self.encode(x)
-        h = (h1 + h2).unsqueeze(0)
+        h = self.encode(x).unsqueeze(0)
 
         ctc_probs, ctc_ids = torch.exp(self.ctc.log_softmax(h)).max(dim=-1)
         y_hat = torch.stack([x[0] for x in groupby(ctc_ids[0])])
@@ -507,3 +738,51 @@ class E2E(E2ETransformer):
         hyp = {"score": 0.0, "yseq": [self.sos] + ret + [self.eos]}
 
         return [hyp]
+
+    def calculate_all_attentions(self, xs_pad, ilens, ys_pad):
+        """E2E attention calculation.
+
+        :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax, idim)
+        :param torch.Tensor ilens: batch of lengths of input sequences (B)
+        :param torch.Tensor ys_pad: batch of padded token id sequence tensor (B, Lmax)
+        :return: attention weights (B, H, Lmax, Tmax)
+        :rtype: float ndarray
+        """
+        self.eval()
+        with torch.no_grad():
+            self.forward(xs_pad, ilens, ys_pad)
+        ret = dict()
+        for name, m in self.named_modules():
+            if (
+                isinstance(m, MultiHeadedAttention)
+                or isinstance(m, DynamicConvolution)
+                or isinstance(m, RelPositionMultiHeadedAttention)
+            ):
+                ret[name] = m.attn.cpu().numpy()
+            if isinstance(m, DynamicConvolution2D):
+                ret[name + "_time"] = m.attn_t.cpu().numpy()
+                ret[name + "_freq"] = m.attn_f.cpu().numpy()
+        self.train()
+        return ret
+
+    def calculate_all_ctc_probs(self, xs_pad, ilens, ys_pad):
+        """E2E CTC probability calculation.
+
+        :param torch.Tensor xs_pad: batch of padded input sequences (B, Tmax)
+        :param torch.Tensor ilens: batch of lengths of input sequences (B)
+        :param torch.Tensor ys_pad: batch of padded token id sequence tensor (B, Lmax)
+        :return: CTC probability (B, Tmax, vocab)
+        :rtype: float ndarray
+        """
+        ret = None
+        if self.mtlalpha == 0:
+            return ret
+
+        self.eval()
+        with torch.no_grad():
+            self.forward(xs_pad, ilens, ys_pad)
+        for name, m in self.named_modules():
+            if isinstance(m, CTC) and m.probs is not None:
+                ret = m.probs.cpu().numpy()
+        self.train()
+        return ret

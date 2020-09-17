@@ -35,7 +35,7 @@ class DecoderLayer(nn.Module):
         self,
         size,
         self_attn,
-        src_attn,
+        src_attn,src_attn2,
         feed_forward,
         dropout_rate,
         normalize_before=True,
@@ -46,6 +46,7 @@ class DecoderLayer(nn.Module):
         self.size = size
         self.self_attn = self_attn
         self.src_attn = src_attn
+        self.src_attn2 = src_attn2
         self.feed_forward = feed_forward
         self.norm1 = LayerNorm(size)
         self.norm2 = LayerNorm(size)
@@ -102,6 +103,7 @@ class DecoderLayer(nn.Module):
             x = self.norm1(x)
         # -----MHAtt
         residual = x
+        residual2 = x
         if self.normalize_before:
             x = self.norm2(x)
             x2 = self.norm22(x)
@@ -110,10 +112,10 @@ class DecoderLayer(nn.Module):
                 (x, self.src_attn(x, memory, memory, memory_mask)), dim=-1
             )
             x_concat2 = torch.cat(
-                (x2, self.src_attn(x2, memory2, memory2, memory_mask2)), dim=-1
+                (x2, self.src_attn2(x2, memory2, memory2, memory_mask2)), dim=-1
             )
             x1 = residual + self.concat_linear2(x_concat)
-            x2 = residual + self.concat_linear22(x_concat2)
+            x2 = residual2 + self.concat_linear22(x_concat2)
             x = (x1 + x2)/2
         else:
             x = residual + self.dropout(self.src_attn(x, memory, memory, memory_mask))

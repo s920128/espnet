@@ -93,7 +93,7 @@ class Encoder(torch.nn.Module):
         """Construct an Encoder object."""
         super(Encoder, self).__init__()
         self._register_load_state_dict_pre_hook(_pre_hook)
-
+        print("----init MED Encoder----")
         if input_layer == "linear":
             self.embed = torch.nn.Sequential(
                 torch.nn.Linear(idim, attention_dim),

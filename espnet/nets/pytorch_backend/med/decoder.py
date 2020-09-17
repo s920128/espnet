@@ -88,6 +88,7 @@ class Decoder(BatchScorerInterface, torch.nn.Module):
         """Construct an Decoder object."""
         torch.nn.Module.__init__(self)
         self._register_load_state_dict_pre_hook(_pre_hook)
+        print("----init MED Decoder----")
         if input_layer == "embed":
             self.embed = torch.nn.Sequential(
                 torch.nn.Embedding(odim, attention_dim),
@@ -116,6 +117,9 @@ class Decoder(BatchScorerInterface, torch.nn.Module):
                     attention_dim,
                     MultiHeadedAttention(
                         attention_heads, attention_dim, self_attention_dropout_rate
+                    ),
+                    MultiHeadedAttention(
+                        attention_heads, attention_dim, src_attention_dropout_rate
                     ),
                     MultiHeadedAttention(
                         attention_heads, attention_dim, src_attention_dropout_rate

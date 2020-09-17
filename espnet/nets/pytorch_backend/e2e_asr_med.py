@@ -228,6 +228,7 @@ class E2E(ASRInterface, torch.nn.Module):
         :param int odim: dimension of outputs
         :param Namespace args: argument Namespace containing options
         """
+        print("----USE MED----")
         torch.nn.Module.__init__(self)
 
         # fill missing arguments for compatibility
@@ -751,12 +752,15 @@ class E2E(ASRInterface, torch.nn.Module):
         with torch.no_grad():
             self.forward(xs_pad, ilens, ys_pad)
         ret = dict()
+
         for name, m in self.named_modules():
             if (
                 isinstance(m, MultiHeadedAttention)
                 or isinstance(m, DynamicConvolution)
                 or isinstance(m, RelPositionMultiHeadedAttention)
             ):
+                if name.find("src_attn2")>=0:
+                    continue
                 ret[name] = m.attn.cpu().numpy()
             if isinstance(m, DynamicConvolution2D):
                 ret[name + "_time"] = m.attn_t.cpu().numpy()
